@@ -1,0 +1,27 @@
+# Dataset — too large for Git
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+venv/
+.venv/
+
+# Spark
+spark-warehouse/
+derby.log
+metastore_db/
+
+# Docker
+.docker/
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
