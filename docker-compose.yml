@@ -1,5 +1,3 @@
-version: "3.8"
-
 networks:
   kafka-net:
     driver: bridge
@@ -10,25 +8,32 @@ volumes:
 
 services:
 
-  # ── Zookeeper ─────────────────────────────────────────────────────────────
+  # Zookeeper — Kafka broker coordination and leader election
   zookeeper:
     image: confluentinc/cp-zookeeper:7.5.0
     container_name: zookeeper
+    restart: on-failure
     networks:
       - kafka-net
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
+      ZOOKEEPER_MAX_CLIENT_CNXNS: 60
     healthcheck:
       test: ["CMD", "bash", "-c", "echo ruok | nc localhost 2181"]
       interval: 10s
       timeout: 5s
       retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 512m
 
-  # ── Kafka Broker ──────────────────────────────────────────────────────────
+  # Kafka broker — central message bus for all pipeline events
   kafka:
     image: confluentinc/cp-kafka:7.5.0
     container_name: kafka
+    restart: on-failure
     networks:
       - kafka-net
     depends_on:
@@ -43,18 +48,44 @@ services:
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
       KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_LOG_SEGMENT_BYTES: 1073741824
+      KAFKA_NUM_PARTITIONS: 3
     healthcheck:
       test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
       interval: 15s
       timeout: 10s
       retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 1g
 
-  # ── PostgreSQL Sink ───────────────────────────────────────────────────────
+  # Topic initialiser — creates taxi-events topic before any service connects
+  # Exits cleanly after creation; idempotent on restart
+  kafka-init:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka-init
+    networks:
+      - kafka-net
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command: >
+      "kafka-topics --bootstrap-server kafka:29092
+        --create --if-not-exists
+        --topic taxi-events
+        --partitions 3
+        --replication-factor 1 &&
+       echo 'Topic taxi-events created successfully'"
+
+  # PostgreSQL — persistent sink for aggregated streaming results
   postgres:
     image: postgres:15-alpine
     container_name: postgres
+    restart: on-failure
     networks:
       - kafka-net
     environment:
@@ -71,37 +102,48 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 512m
 
-  # ── Python Producer ───────────────────────────────────────────────────────
+  # Python producer — replays NYC Taxi CSV as a continuous Kafka event stream
   producer:
     build:
       context: ./producer
       dockerfile: Dockerfile
     container_name: producer
+    restart: on-failure
     networks:
       - kafka-net
     depends_on:
-      kafka:
-        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       KAFKA_TOPIC: taxi-events
       DATA_PATH: /data/taxi_data.csv
-      REPLAY_DELAY_MS: 10        # ms between events; lower = faster replay
+      REPLAY_DELAY_MS: 10
+      CHUNK_SIZE: 10000
     volumes:
-      - ./data:/data             # mount your CSV here
+      - ./data:/data:ro
+    deploy:
+      resources:
+        limits:
+          memory: 512m
 
-  # ── Spark Structured Streaming ────────────────────────────────────────────
+  # Spark Structured Streaming — consumes, aggregates, and writes to PostgreSQL
   spark:
     build:
       context: ./spark
       dockerfile: Dockerfile
     container_name: spark
+    restart: on-failure
     networks:
       - kafka-net
     depends_on:
-      kafka:
-        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
     environment:
@@ -111,5 +153,13 @@ services:
       POSTGRES_USER: pipeline
       POSTGRES_PASSWORD: pipeline123
       CHECKPOINT_DIR: /tmp/spark-checkpoint
+      WINDOW_DURATION: "5 minutes"
+      SLIDE_DURATION: "1 minute"
+      WATERMARK_DELAY: "10 minutes"
+      TRIGGER_INTERVAL: "30 seconds"
     volumes:
       - spark-checkpoint:/tmp/spark-checkpoint
+    deploy:
+      resources:
+        limits:
+          memory: 2g

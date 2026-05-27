@@ -1,33 +1,60 @@
 """
 producer.py
 -----------
-Reads the NYC Taxi Trip CSV in chunks and replays each row as a JSON
-event to a Kafka topic, simulating a real-time data stream.
-Chunked reading prevents out-of-memory errors on large files.
+Reads the NYC Taxi Trip CSV in configurable chunks and replays each row
+as a serialised JSON event to a Kafka topic, simulating a real-time
+data stream. Chunked reading keeps memory consumption constant regardless
+of dataset size.
+
+Environment variables:
+  KAFKA_BOOTSTRAP_SERVERS   Broker address          (default: kafka:29092)
+  KAFKA_TOPIC               Target topic name       (default: taxi-events)
+  DATA_PATH                 Path to CSV file        (default: /data/taxi_data.csv)
+  REPLAY_DELAY_MS           Delay between events ms (default: 10)
+  CHUNK_SIZE                Rows per CSV chunk      (default: 10000)
 """
 
 import os
 import time
 import json
+import signal
 import logging
 import pandas as pd
+from typing import Iterator
 from kafka import KafkaProducer
 from kafka.errors import NoBrokersAvailable
 
+# ── Logging ───────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger(__name__)
 
-BOOTSTRAP_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:29092")
-TOPIC             = os.environ.get("KAFKA_TOPIC", "taxi-events")
-DATA_PATH         = os.environ.get("DATA_PATH", "/data/taxi_data.csv")
-DELAY_S           = int(os.environ.get("REPLAY_DELAY_MS", 10)) / 1000.0
-CHUNK_SIZE        = 10_000  # rows per chunk — keeps memory usage low
+# ── Configuration ─────────────────────────────────────────────────────────
+BOOTSTRAP_SERVERS: str = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:29092")
+TOPIC:             str = os.environ.get("KAFKA_TOPIC", "taxi-events")
+DATA_PATH:         str = os.environ.get("DATA_PATH", "/data/taxi_data.csv")
+DELAY_S:         float = int(os.environ.get("REPLAY_DELAY_MS", 10)) / 1000.0
+CHUNK_SIZE:        int = int(os.environ.get("CHUNK_SIZE", 10_000))
+
+# ── Graceful shutdown ─────────────────────────────────────────────────────
+_shutdown: bool = False
+
+def _handle_signal(signum: int, frame) -> None:
+    global _shutdown
+    logger.info("Shutdown signal received — finishing current chunk then exiting.")
+    _shutdown = True
+
+signal.signal(signal.SIGTERM, _handle_signal)
+signal.signal(signal.SIGINT, _handle_signal)
 
 
-def wait_for_kafka(retries: int = 10, delay: int = 5) -> KafkaProducer:
+def connect_producer(retries: int = 10, backoff: int = 5) -> KafkaProducer:
+    """
+    Attempt to connect to Kafka with retry logic.
+    Raises RuntimeError if all attempts are exhausted.
+    """
     for attempt in range(1, retries + 1):
         try:
             producer = KafkaProducer(
@@ -36,67 +63,114 @@ def wait_for_kafka(retries: int = 10, delay: int = 5) -> KafkaProducer:
                 acks="all",
                 retries=5,
                 linger_ms=5,
+                compression_type="gzip",
             )
-            logger.info("Connected to Kafka at %s", BOOTSTRAP_SERVERS)
+            logger.info("Connected to Kafka broker at %s", BOOTSTRAP_SERVERS)
             return producer
         except NoBrokersAvailable:
             logger.warning(
-                "Kafka not ready (attempt %d/%d). Retrying in %ds...",
-                attempt, retries, delay,
+                "Broker unavailable (attempt %d/%d) — retrying in %ds",
+                attempt, retries, backoff,
             )
-            time.sleep(delay)
-    raise RuntimeError("Could not connect to Kafka after %d attempts." % retries)
+            time.sleep(backoff)
+    raise RuntimeError(
+        "Failed to connect to Kafka at %s after %d attempts." % (BOOTSTRAP_SERVERS, retries)
+    )
 
 
-def get_time_column(columns):
+def detect_time_column(columns: list) -> str:
+    """
+    Identify the pickup datetime column by name heuristic.
+    Supports both pre-2017 GPS and post-2017 zone-ID dataset schemas.
+    """
     candidates = [
         c for c in columns
         if "pickup" in c and ("datetime" in c or "time" in c)
     ]
     if not candidates:
-        raise ValueError("No pickup datetime column found. Columns: %s" % list(columns))
+        raise ValueError(
+            "Could not detect a pickup datetime column. "
+            "Available columns: %s" % columns
+        )
+    logger.info("Pickup datetime column detected: '%s'", candidates[0])
     return candidates[0]
 
 
-def produce(producer: KafkaProducer):
-    total_sent = 0
-    chunk_num  = 0
+def serialise_record(row: pd.Series) -> dict:
+    """Convert a DataFrame row to a JSON-serialisable dict."""
+    record = row.to_dict()
+    for key, value in record.items():
+        if isinstance(value, pd.Timestamp):
+            record[key] = value.isoformat()
+        elif pd.isna(value):
+            record[key] = None
+    return record
 
-    for chunk in pd.read_csv(DATA_PATH, chunksize=CHUNK_SIZE, low_memory=False):
+
+def chunk_reader(path: str, chunk_size: int) -> Iterator[pd.DataFrame]:
+    """Yield normalised DataFrame chunks from the CSV file."""
+    for chunk in pd.read_csv(path, chunksize=chunk_size, low_memory=False):
+        chunk.columns = [c.strip().lower().replace(" ", "_") for c in chunk.columns]
+        yield chunk
+
+
+def produce(producer: KafkaProducer) -> None:
+    """
+    Stream all rows from the dataset to Kafka.
+    Reports throughput metrics after every chunk.
+    """
+    global _shutdown
+    total_sent:  int   = 0
+    chunk_num:   int   = 0
+    time_col:    str   = ""
+    start_time:  float = time.time()
+
+    for chunk in chunk_reader(DATA_PATH, CHUNK_SIZE):
+        if _shutdown:
+            logger.info("Shutdown flag set — stopping producer cleanly.")
+            break
+
         chunk_num += 1
 
-        # Normalise column names on first chunk
-        chunk.columns = [c.strip().lower().replace(" ", "_") for c in chunk.columns]
-
         if chunk_num == 1:
-            time_col = get_time_column(chunk.columns)
-            logger.info("Time column detected: %s", time_col)
+            time_col = detect_time_column(list(chunk.columns))
 
         chunk[time_col] = pd.to_datetime(chunk[time_col], errors="coerce")
         chunk = chunk.dropna(subset=[time_col])
 
+        chunk_start = time.time()
         for _, row in chunk.iterrows():
-            record = row.to_dict()
-            for k, v in record.items():
-                if isinstance(v, pd.Timestamp):
-                    record[k] = v.isoformat()
-                elif pd.isna(v):
-                    record[k] = None
-
-            producer.send(TOPIC, value=record)
+            producer.send(TOPIC, value=serialise_record(row))
             total_sent += 1
             time.sleep(DELAY_S)
 
         producer.flush()
-        logger.info("Chunk %d sent — total events so far: %d", chunk_num, total_sent)
 
-    logger.info("All %d events published to topic '%s'.", total_sent, TOPIC)
+        elapsed       = time.time() - chunk_start
+        throughput    = len(chunk) / elapsed if elapsed > 0 else 0
+        total_elapsed = time.time() - start_time
+
+        logger.info(
+            "Chunk %d complete | events this chunk: %d | "
+            "throughput: %.1f events/s | total sent: %d | elapsed: %.1fs",
+            chunk_num, len(chunk), throughput, total_sent, total_elapsed,
+        )
+
+    producer.flush()
+    logger.info(
+        "Producer finished. Total events published to '%s': %d",
+        TOPIC, total_sent,
+    )
 
 
-def main():
-    producer = wait_for_kafka()
-    logger.info("Starting chunked event replay to topic '%s'...", TOPIC)
+def main() -> None:
+    logger.info(
+        "Starting producer | topic=%s | chunk_size=%d | delay=%.3fs",
+        TOPIC, CHUNK_SIZE, DELAY_S,
+    )
+    producer = connect_producer()
     produce(producer)
+    producer.close()
 
 
 if __name__ == "__main__":
